@@ -41,11 +41,32 @@ Step 3 - Add this SessionStart hook entry to ~/.claude/settings.json inside the 
 After all steps, tell me to restart the session.
 ```
 
-### 수동 설치
+### 1. Skill (Claude Code용)
 
-직접 설치하려면 위 1~3단계를 수동으로 진행하세요.
+스킬 폴더를 Claude 스킬 디렉토리에 복사합니다:
 
-SessionStart 훅은 **필수**입니다. 이 훅이 Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
+```bash
+cp -a .claude/skills/context-cleaner ~/.claude/skills/
+```
+
+### 2. SessionStart Hook (필수)
+
+이 훅은 **필수**입니다. Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
+
+훅 스크립트를 복사합니다:
+
+```bash
+cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+```
+
+`~/.claude/settings.json`에 등록합니다. `hooks` 객체에 `SessionStart` 항목을 추가하세요 (기존 훅은 지우지 마세요):
+
+```json
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+```
+
+등록 후 Claude Code 세션을 재시작하면 적용됩니다.
 
 ## 사용법
 

@@ -41,11 +41,32 @@ Step 3 - Add this SessionStart hook entry to ~/.claude/settings.json inside the 
 After all steps, tell me to restart the session.
 ```
 
-### Manual installation
+### 1. Skill (for Claude Code)
 
-If you prefer to install manually, follow steps 1-3 above by hand.
+Copy the skill folder to your Claude skills directory:
 
-The SessionStart hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
+```bash
+cp -a .claude/skills/context-cleaner ~/.claude/skills/
+```
+
+### 2. SessionStart Hook (required)
+
+This hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
+
+Copy the hook script:
+
+```bash
+cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+```
+
+Then register it in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object (don't remove existing hooks):
+
+```json
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+```
+
+After registration, restart your Claude Code session.
 
 ## Usage
 
