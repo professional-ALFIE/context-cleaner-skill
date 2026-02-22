@@ -39,6 +39,8 @@ Claude Code는 resume 시 JSONL의 모든 키가 존재한다고 가정하고 �
 | user-marked | <clean>...</clean> 패턴 |
 | isMeta | Skill 결과 등 isMeta 메시지의 content[0].text |
 | local-cmd-output | bash-input 메시지의 자식 메시지 (로컬 커맨드 출력) |
+| toolUseResult.prompt | toolUseResult.prompt (agent_prompt) |
+| local-command-stdout | <local-command-stdout>...</local-command-stdout> 내부 콘텐츠 |
 
 [파일명 규칙]
 - 마지막 12자리를 '00effaced{NNN}'으로 교체
@@ -98,6 +100,10 @@ CLEANED_LOCAL_CMD_OUTPUT = "[context-cleaner: local-cmd-output]"
 CLEANED_USER_MARKED = "[context-cleaner: user-marked]"
 CLEANED_TASK_OUTPUT = "[context-cleaner: taskoutput]"
 CLEANED_BASH_PROGRESS = "[context-cleaner: bashoutput]"
+CLEANED_AGENT_PROMPT = "[context-cleaner: agent_prompt]"
+CLEANED_BASE64_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
+CLEANED_TOOL_RESULT_STRING = "[context-cleaner: tool_result_string]"
+CLEANED_TEAMMATE_MESSAGE = "[context-cleaner: teammate_message]"
 
 # 정규식 패턴
 # 로컬 명령 출력: <local-command-caveat>...<bash-input>CMD</bash-input><bash-stdout>OUT</bash-stdout><bash-stderr>ERR</bash-stderr>
@@ -108,6 +114,8 @@ BASH_TAGS_PATTERN = re.compile(
     re.DOTALL,
 )
 USER_MARKED_PATTERN = re.compile(r"<clean>.*?</clean>", re.DOTALL)
+TEAMMATE_MESSAGE_PATTERN = re.compile(r'(<teammate-message[^>]*>).*?(</teammate-message>)', re.DOTALL)
+LOCAL_COMMAND_STDOUT_PATTERN = re.compile(r'(<local-command-stdout>).*?(</local-command-stdout>)', re.DOTALL)
 
 
 # ============================================================================
@@ -151,6 +159,20 @@ class CleaningStats:
         self.meta_content_bytes = 0
         self.local_cmd_output_count = 0
         self.local_cmd_output_bytes = 0
+        self.agent_progress_count = 0
+        self.agent_progress_bytes = 0
+        self.task_content_text_count = 0
+        self.task_content_text_bytes = 0
+        self.base64_image_count = 0
+        self.base64_image_bytes = 0
+        self.tool_result_string_count = 0
+        self.tool_result_string_bytes = 0
+        self.teammate_message_count = 0
+        self.teammate_message_bytes = 0
+        self.tool_use_result_prompt_count = 0
+        self.tool_use_result_prompt_bytes = 0
+        self.local_command_stdout_count = 0
+        self.local_command_stdout_bytes = 0
 
     def total_bytes(self):
         return (
@@ -171,6 +193,13 @@ class CleaningStats:
             + self.bash_progress_bytes
             + self.meta_content_bytes
             + self.local_cmd_output_bytes
+            + self.agent_progress_bytes
+            + self.task_content_text_bytes
+            + self.base64_image_bytes
+            + self.tool_result_string_bytes
+            + self.teammate_message_bytes
+            + self.tool_use_result_prompt_bytes
+            + self.local_command_stdout_bytes
         )
 
     def print_stats(self, source_path, output_path, original_size, new_size, new_session_id=None):
@@ -218,6 +247,12 @@ class CleaningStats:
             f"  Bash progress:       {self.bash_progress_count:>4} cleaned ({self.bash_progress_bytes:,} bytes)"
         )
         print(
+            f"  Agent progress:      {self.agent_progress_count:>4} cleaned ({self.agent_progress_bytes:,} bytes)"
+        )
+        print(
+            f"  Task content text:   {self.task_content_text_count:>4} cleaned ({self.task_content_text_bytes:,} bytes)"
+        )
+        print(
             f"  Bash tags:           {self.bash_tags_count:>4} cleaned ({self.bash_tags_bytes:,} bytes)"
         )
         print(
@@ -228,6 +263,21 @@ class CleaningStats:
         )
         print(
             f"  Local cmd output:    {self.local_cmd_output_count:>4} cleaned ({self.local_cmd_output_bytes:,} bytes)"
+        )
+        print(
+            f"  Base64 images:       {self.base64_image_count:>4} cleaned ({self.base64_image_bytes:,} bytes)"
+        )
+        print(
+            f"  Tool result string:  {self.tool_result_string_count:>4} cleaned ({self.tool_result_string_bytes:,} bytes)"
+        )
+        print(
+            f"  Teammate message:    {self.teammate_message_count:>4} cleaned ({self.teammate_message_bytes:,} bytes)"
+        )
+        print(
+            f"  ToolResult prompt:   {self.tool_use_result_prompt_count:>4} cleaned ({self.tool_use_result_prompt_bytes:,} bytes)"
+        )
+        print(
+            f"  Local cmd stdout:    {self.local_command_stdout_count:>4} cleaned ({self.local_command_stdout_bytes:,} bytes)"
         )
         print(f"  Hook progress:       {self.hook_progress_count:>4} lines removed")
         print(f"  SessionId updated:   {self.sessionid_count:>4} entries")
@@ -747,6 +797,59 @@ def clean_task_output(obj, stats):
     return False
 
 
+def clean_task_content_text(obj, stats):
+    """
+    Task 도구의 content 내부 text 정리 (user 행)
+    - toolUseResult가 dict이고 content 키에 list가 있는 경우
+    - 구조: toolUseResult = {"status": "completed", "prompt": "...", "content": [{"type": "text", "text": "..."}]}
+    - content 내부의 text 값만 placeholder로 치환
+    - prompt도 placeholder로 치환
+    - status, agentId 등 다른 키는 유지
+
+    [v4 신규] 기존 clean_list_tool_use_result는 toolUseResult가 list인 경우만 처리.
+    이 함수는 toolUseResult가 dict이고 content 키가 있는 경우를 처리.
+    """
+    try:
+        result = obj.get("toolUseResult", {})
+        if not isinstance(result, dict):
+            return False
+        content = result.get("content")
+        if not isinstance(content, list):
+            return False
+
+        # Write 결과(type: create/update)나 task 결과는 다른 함수가 처리
+        if result.get("type") in ["create", "update"]:
+            return False
+        if "task" in result:
+            return False
+
+        cleaned = False
+
+        # 1. content[N].text → CLEANED_TOOL_RESULT
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                text_val = item["text"]
+                if text_val and text_val != CLEANED_TOOL_RESULT:
+                    stats.task_content_text_bytes += len(str(text_val).encode("utf-8"))
+                    item["text"] = CLEANED_TOOL_RESULT
+                    cleaned = True
+
+        # 2. prompt → CLEANED_AGENT_PROMPT
+        if "prompt" in result:
+            prompt_val = result["prompt"]
+            if isinstance(prompt_val, str) and prompt_val and prompt_val != CLEANED_AGENT_PROMPT:
+                stats.task_content_text_bytes += len(prompt_val.encode("utf-8"))
+                result["prompt"] = CLEANED_AGENT_PROMPT
+                cleaned = True
+
+        if cleaned:
+            stats.task_content_text_count += 1
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def clean_bash_progress(obj, stats):
     """
     Bash progress 데이터 정리 (progress 행)
@@ -773,6 +876,91 @@ def clean_bash_progress(obj, stats):
     except Exception:
         pass
     return False
+
+
+def clean_agent_progress(obj, stats):
+    """
+    agent_progress 데이터 정리 (progress 행)
+    - type: "progress" + data.type: "agent_progress" 인 행 대상
+    - 경로: data.message.message.content[N].content → placeholder 치환
+    - content가 list인 경우: 내부 text 값만 치환
+    - content가 string인 경우: 문자열 전체를 치환
+    - data.prompt도 치환 (어떤 프롬프트를 보냈는지 대형 텍스트)
+
+    [v4 신규] agent_progress 행은 서브에이전트의 tool_result를 감싸는 wrapper.
+    기존 clean_tool_result_content()는 obj.message 경로만 보기 때문에
+    obj.data.message.message 경로에 있는 데이터를 놓침.
+    """
+    try:
+        if obj.get("type") != "progress":
+            return False
+        data = obj.get("data", {})
+        if not isinstance(data, dict) or data.get("type") != "agent_progress":
+            return False
+
+        cleaned = False
+
+        # 1. data.prompt 치환
+        if "prompt" in data:
+            original = data["prompt"]
+            if isinstance(original, str) and original and original != CLEANED_AGENT_PROMPT:
+                stats.agent_progress_bytes += len(original.encode("utf-8"))
+                data["prompt"] = CLEANED_AGENT_PROMPT
+                cleaned = True
+
+        # 2. data.message.message.content[N] 처리
+        message_wrapper = data.get("message", {})
+        if isinstance(message_wrapper, dict):
+            inner_message = message_wrapper.get("message", {})
+            if isinstance(inner_message, dict):
+                content_list = inner_message.get("content", [])
+                if isinstance(content_list, list):
+                    for item in content_list:
+                        if not isinstance(item, dict):
+                            continue
+
+                        # 2a. content 필드 처리 (tool_result의 결과)
+                        if "content" in item:
+                            content_val = item["content"]
+                            if isinstance(content_val, str):
+                                # string인 경우 전체 치환
+                                if content_val and content_val != CLEANED_TOOL_RESULT:
+                                    stats.agent_progress_bytes += len(content_val.encode("utf-8"))
+                                    item["content"] = CLEANED_TOOL_RESULT
+                                    cleaned = True
+                            elif isinstance(content_val, list):
+                                # list인 경우: [{type: "text", text: "..."}, ...] 내부 text만 치환
+                                for sub_item in content_val:
+                                    if isinstance(sub_item, dict) and "text" in sub_item:
+                                        text_val = sub_item["text"]
+                                        if text_val and text_val != CLEANED_TOOL_RESULT:
+                                            stats.agent_progress_bytes += len(str(text_val).encode("utf-8"))
+                                            sub_item["text"] = CLEANED_TOOL_RESULT
+                                            cleaned = True
+
+                        # 2b. input.command 필드 처리 (agent 내부 bash 입력)
+                        inp = item.get("input", {})
+                        if isinstance(inp, dict) and "command" in inp:
+                            cmd_val = inp["command"]
+                            if isinstance(cmd_val, str) and cmd_val and cmd_val != CLEANED_BASH_INPUT:
+                                stats.agent_progress_bytes += len(cmd_val.encode("utf-8"))
+                                inp["command"] = CLEANED_BASH_INPUT
+                                cleaned = True
+                        # 2c. text 필드 처리 (agent_prompt 중복 텍스트)
+                        if item.get("type") == "text" and "text" in item:
+                            text_val = item["text"]
+                            if isinstance(text_val, str) and len(text_val) > 100 and "[context-cleaner:" not in text_val:
+                                stats.agent_progress_bytes += len(text_val.encode("utf-8"))
+                                item["text"] = CLEANED_AGENT_PROMPT
+                                cleaned = True
+
+        if cleaned:
+            stats.agent_progress_count += 1
+            return True
+    except Exception:
+        pass
+    return False
+
 
 
 def clean_input_filepath(obj, stats):
@@ -928,6 +1116,156 @@ def clean_meta_content(obj, stats):
     return False
 
 
+def clean_base64_images(obj, stats):
+    """
+    base64 인코딩된 이미지 데이터 정리 (user 행)
+    - message.content 배열 내 type=="image"인 항목의 source.data를 치환
+    - source.type, source.media_type 등 구조는 보존
+    - data 값만 placeholder로 치환
+
+    [v4 신규] 스크린샷 등 이미지 첨부 시 수십만~수백만 자의 base64 데이터가
+    포함되어 파일 크기의 상당 부분을 차지. resume 시 이미지는 불필요하므로 치환.
+    """
+    try:
+        message = obj.get("message", {})
+        if not isinstance(message, dict) or "content" not in message:
+            return False
+        content = message["content"]
+        if not isinstance(content, list):
+            return False
+
+        cleaned = False
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image":
+                source = item.get("source", {})
+                if isinstance(source, dict) and "data" in source:
+                    data = source["data"]
+                    if data and data != CLEANED_BASE64_IMAGE:
+                        stats.base64_image_bytes += len(str(data).encode("utf-8"))
+                        source["data"] = CLEANED_BASE64_IMAGE
+                        source["media_type"] = "image/png"
+                        stats.base64_image_count += 1
+                        cleaned = True
+        return cleaned
+    except Exception:
+        pass
+    return False
+
+
+def clean_tool_use_result_string(obj, stats):
+    """
+    toolUseResult.result (string) 정리
+    - WebFetch 등의 도구가 반환하는 result 문자열 (수천 자)
+    - bytes, code, codeText, durationMs, url 등 메타데이터는 보존
+    """
+    try:
+        result = obj.get("toolUseResult", {})
+        if isinstance(result, dict) and "result" in result:
+            result_val = result["result"]
+            if isinstance(result_val, str) and len(result_val) > 200 and result_val != CLEANED_TOOL_RESULT_STRING:
+                stats.tool_result_string_bytes += len(result_val.encode("utf-8"))
+                stats.tool_result_string_count += 1
+                result["result"] = CLEANED_TOOL_RESULT_STRING
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def clean_teammate_message(obj, stats):
+    """
+    teammate-message 태그 내부 콘텐츠 정리
+    - type: "user" + teamName이 있는 메시지의 message.content에서
+      <teammate-message ...>본문</teammate-message> 의 본문만 placeholder로 치환
+    - 여는 태그(summary, teammate_id, color 속성 포함)와 닫는 태그는 보존
+    """
+    try:
+        if obj.get("type") != "user" or not obj.get("teamName"):
+            return False
+        message = obj.get("message", {})
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content", "")
+        if not isinstance(content, str) or "<teammate-message" not in content:
+            return False
+
+        cleaned = TEAMMATE_MESSAGE_PATTERN.sub(
+            r'\1[context-cleaner: teammate_message]\2', content
+        )
+        if cleaned != content:
+            stats.teammate_message_bytes += len(content.encode("utf-8")) - len(cleaned.encode("utf-8"))
+            stats.teammate_message_count += 1
+            message["content"] = cleaned
+            return True
+    except Exception:
+        pass
+    return False
+
+def clean_tool_use_result_prompt(obj, stats):
+    """
+    toolUseResult.prompt 정리 (누락 보완)
+    - toolUseResult가 dict이고 prompt 키가 있는 모든 경우를 커버
+    - status: "teammate_spawned", "async_launched" 등에서 누락된 prompt 치환
+    - 이미 clean_task_content_text()가 처리하는 content+prompt 조합은 그 함수에서 처리됨
+    - 이 함수는 content 키가 없지만 prompt가 있는 나머지 케이스를 보완
+    """
+    try:
+        result = obj.get("toolUseResult", {})
+        if not isinstance(result, dict):
+            return False
+        prompt_val = result.get("prompt")
+        if not isinstance(prompt_val, str):
+            return False
+        if len(prompt_val) <= 100:
+            return False
+        if "[context-cleaner:" in prompt_val:
+            return False
+
+        stats.tool_use_result_prompt_bytes += len(prompt_val.encode("utf-8"))
+        stats.tool_use_result_prompt_count += 1
+        result["prompt"] = CLEANED_AGENT_PROMPT
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def clean_local_command_stdout(obj, stats):
+    """
+    <local-command-stdout> 태그 내부 대형 콘텐츠 정리
+    - type: user + message.content가 string + <local-command-stdout> 포함 + 200자 초과
+    - 여는 태그와 닫는 태그는 보존, 내부 내용만 placeholder로 치환
+    - ANSI 이스케이프 코드를 포함한 Context Usage 출력 등
+    """
+    try:
+        if obj.get("type") != "user":
+            return False
+        message = obj.get("message", {})
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            return False
+        if "<local-command-stdout>" not in content:
+            return False
+        if len(content) <= 200:
+            return False
+        if "[context-cleaner:" in content:
+            return False
+
+        cleaned = LOCAL_COMMAND_STDOUT_PATTERN.sub(
+            r'\1[context-cleaner: local_command_stdout]\2', content
+        )
+        if cleaned != content:
+            stats.local_command_stdout_bytes += len(content.encode("utf-8")) - len(cleaned.encode("utf-8"))
+            stats.local_command_stdout_count += 1
+            message["content"] = cleaned
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def update_session_id(obj, new_session_id, stats):
     """
     sessionId를 새 파일명과 동일하게 변경
@@ -978,11 +1316,18 @@ def process_line(obj, new_session_id, stats):
     clean_tool_result_content(obj, stats)       # message.content[0].content (tool_result)
     clean_list_tool_use_result(obj, stats)      # toolUseResult가 list인 경우
     clean_task_output(obj, stats)               # Task agent output
+    clean_task_content_text(obj, stats)           # Task content 내부 text
     clean_bash_progress(obj, stats)             # bash_progress 데이터
+    clean_agent_progress(obj, stats)             # agent_progress 데이터
     clean_input_filepath(obj, stats)            # input의 file_path → 파일명만
     clean_bash_tags(obj, stats)                 # <bash-stdout>...<bash-stderr>... 패턴
     clean_user_marked(obj, stats)               # <clean>...</clean> 패턴
     clean_meta_content(obj, stats)              # isMeta (Skill 결과 등)
+    clean_base64_images(obj, stats)              # base64 이미지 데이터
+    clean_tool_use_result_string(obj, stats)   # toolUseResult.result (string)
+    clean_teammate_message(obj, stats)          # teammate-message 내부 콘텐츠
+    clean_tool_use_result_prompt(obj, stats)  # toolUseResult.prompt (누락 보완)
+    clean_local_command_stdout(obj, stats)    # <local-command-stdout> 태그
 
 
 def clean_transcript(source_path):
