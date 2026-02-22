@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Context Cleaner v2 - Claude Code 세션 파일 최적화 도구
+Context Cleaner v4 - Claude Code 세션 파일 최적화 도구
 
 목적: "상세 변경내역은 몰라도, 흐름은 기억나도록"
 - thinking block, toolUseResult, 파일 전체경로 삭제
@@ -8,6 +8,18 @@ Context Cleaner v2 - Claude Code 세션 파일 최적화 도구
 - session compact보다 토큰 효율과 맥락 기억이 좋음
 
 원본 파일을 보존하고, 00effaced{NNN} suffix로 새 파일 생성.
+
+[핵심 원칙: 치환(replace)만, 삭제(del) 절대 금지]
+=================================================
+Claude Code는 resume 시 JSONL의 모든 키가 존재한다고 가정하고 파싱한다.
+키를 삭제(del)하거나 구조를 바꾸면(dict→str, list→str 등) 런타임 에러 발생.
+
+따라서 클리닝은 반드시:
+  1. 키(key)는 원본 그대로 유지
+  2. 값(value)만 placeholder 문자열로 치환 (예: "[context-cleaner: Read]")
+  3. 배열은 빈 배열 []로 치환 (예: structuredPatch)
+  4. toolUseResult가 list일 때도 list 구조와 내부 dict 키를 유지하고 값만 치환
+  5. 어떤 필드든 하나라도 없어지면 오류 — 구조 보존이 최우선
 
 [삭제 대상 요약]
 ==================
@@ -45,8 +57,8 @@ Context Cleaner v2 - Claude Code 세션 파일 최적화 도구
 - 대화 텍스트, 파일명, 편집 의도
 
 사용법:
-    python3 context-cleaner-v2.py /path/to/session.jsonl
-    ./context-cleaner-v2.py /path/to/session.jsonl
+    python3 context-cleaner.py /path/to/session.jsonl
+    ./context-cleaner.py /path/to/session.jsonl
 """
 
 import sys
@@ -162,7 +174,7 @@ class CleaningStats:
         )
 
     def print_stats(self, source_path, output_path, original_size, new_size, new_session_id=None):
-        print(f"\n✅ Context Cleaner v2 completed!")
+        print(f"\n✅ Context Cleaner v4 completed!")
         print(f"\n📁 Source: {source_path}")
         print(f"📁 Output: {output_path}")
         print(f"\n📊 Cleaning Statistics:")
@@ -635,58 +647,84 @@ def clean_exitplanmode_input(obj, stats):
 
 def clean_tool_result_content(obj, stats):
     """
-    tool_result의 content 정리 (user 행)
-    - message.content[0].content 삭제 (type이 "tool_result"인 경우)
-    - toolUseResult와 별개로 message.content에도 결과가 중복 저장됨
-    - Read, Bash 등 도구 결과가 여기에도 들어있어 용량이 큼 (최대 ~69,000자)
+    message.content[0].content (tool_result) 정리 (user 행)
     """
     try:
-        content = obj.get("message", {}).get("content", [])
-        if content and isinstance(content, list) and len(content) > 0:
-            first = content[0]
-            if first.get("type") == "tool_result" and "content" in first:
-                original = first["content"]
-                if (
-                    original
-                    and isinstance(original, str)
-                    and original != CLEANED_TOOL_RESULT
-                ):
-                    stats.tool_result_count += 1
-                    stats.tool_result_bytes += len(original.encode("utf-8"))
-                    first["content"] = CLEANED_TOOL_RESULT
-                    return True
+        message = obj.get("message", {})
+        if isinstance(message, dict) and "content" in message:
+            content = message["content"]
+            if isinstance(content, list) and len(content) > 0:
+                first = content[0]
+                if isinstance(first, dict) and first.get("type") == "tool_result":
+                    if "content" in first:
+                        original = first["content"]
+                        if isinstance(original, str):
+                            if original and original != CLEANED_TOOL_RESULT:
+                                stats.tool_result_count += 1
+                                stats.tool_result_bytes += len(original.encode("utf-8"))
+                                first["content"] = CLEANED_TOOL_RESULT
+                                return True
+                        elif isinstance(original, list):
+                            # list 내부: [{"type": "text", "text": "..."}, ...] 구조
+                            # type/tool_name 등 키는 유지, text 값만 placeholder로 치환
+                            cleaned = False
+                            for item in original:
+                                if isinstance(item, dict) and "text" in item:
+                                    text_val = item["text"]
+                                    if text_val and text_val != CLEANED_TOOL_RESULT:
+                                        stats.tool_result_bytes += len(
+                                            str(text_val).encode("utf-8")
+                                        )
+                                        item["text"] = CLEANED_TOOL_RESULT
+                                        cleaned = True
+                            if cleaned:
+                                stats.tool_result_count += 1
+                                return True
     except Exception:
         pass
     return False
 
 
-def clean_task_output(obj, stats):
+def clean_list_tool_use_result(obj, stats):
     """
-    Task 도구 결과의 description 정리 (user 행)
-    - toolUseResult.task.description 삭제
-    - Task agent의 결과가 매우 길 수 있음
+    toolUseResult가 list인 경우 처리 (assistant 행)
+    - 구조: toolUseResult = [{"type": "text", "text": "..."}, ...]
+    - text 값만 placeholder로 치환, type/tool_name 등 다른 키는 유지
+    - dict인 경우는 기존 함수들(clean_read_result 등)이 처리하므로 상호배타적
     """
     try:
-        result = obj.get("toolUseResult", {})
-        if isinstance(result, dict) and "task" in result:
-            task = result["task"]
-            if isinstance(task, dict) and "description" in task:
-                original = task["description"]
-                if original and original != CLEANED_TASK_OUTPUT:
-                    stats.task_output_bytes += len(original.encode("utf-8"))
-                    stats.task_output_count += 1
-                    task["description"] = CLEANED_TASK_OUTPUT
-                    return True
+        result = obj.get("toolUseResult")
+        if isinstance(result, list):
+            cleaned = False
+            for item in result:
+                if isinstance(item, dict) and "text" in item:
+                    text_val = item["text"]
+                    if text_val and text_val != CLEANED_TOOL_RESULT:
+                        stats.tool_result_bytes += len(
+                            str(text_val).encode("utf-8")
+                        )
+                        item["text"] = CLEANED_TOOL_RESULT
+                        cleaned = True
+            if cleaned:
+                stats.tool_result_count += 1
+                return True
     except Exception:
         pass
     return False
+
+
 
 
 def clean_task_output(obj, stats):
     """
     Task 도구 결과 정리 (user 행)
-    - toolUseResult.task.output 삭제 (매우 큼)
-    - description은 보존 (맥락 이해용)
+    - toolUseResult.task.output 삭제 (에이전트 실행 결과, 매우 큼)
+    - description은 보존 (어떤 작업을 위임했는지 맥락 이해용)
+
+    [v2 버그 수정] 같은 이름의 함수가 2개 정의되어 있었음:
+      - 첫 번째: description 삭제 (의도와 다름)
+      - 두 번째: output 삭제 (Python은 이것만 인식)
+    → 하나로 통합. output만 삭제, description 보존.
     """
     try:
         result = obj.get("toolUseResult", {})
@@ -911,21 +949,22 @@ def update_session_id(obj, new_session_id, stats):
 # ============================================================================
 # 메인 처리 함수
 # ============================================================================
-def process_line(line, new_session_id, stats):
+def process_line(obj, new_session_id, stats):
     """
-    한 줄(JSON) 처리
-    1. sessionId 업데이트
-    2. 도구별 클리닝 적용
-    """
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        return line  # 파싱 실패 시 원본 반환
+    파싱된 JSON 객체 1개에 대해 모든 클리닝을 적용하는 통합 함수.
+    clean_transcript의 1단계에서 호출됨.
 
+    [v2 → v4 변경]
+    - v2: 이 함수가 존재했지만 clean_transcript에서 호출하지 않고
+      인라인으로 동일 로직을 중복 작성. 게다가 clean_task_output,
+      clean_bash_progress 등 7개 함수 호출이 누락된 불완전한 dead code.
+    - v4: clean_transcript가 이 함수를 호출하도록 통합.
+      모든 클리닝 함수를 빠짐없이 포함.
+    """
     # sessionId 업데이트
     update_session_id(obj, new_session_id, stats)
 
-    # 도구별 클리닝 (순서대로 시도)
+    # 도구별 클리닝 (순서대로 적용, 각 함수는 독립적이므로 모두 실행)
     clean_thinking(obj, stats)
     clean_read_result(obj, stats)
     clean_write_input(obj, stats)
@@ -934,11 +973,16 @@ def process_line(line, new_session_id, stats):
     clean_edit_result(obj, stats)
     clean_bash_input(obj, stats)
     clean_bash_result(obj, stats)
-    clean_filenames_result(obj, stats)  # Grep/Glob 결과
+    clean_filenames_result(obj, stats)          # Grep/Glob 결과
     clean_exitplanmode_input(obj, stats)
-    clean_tool_result_content(obj, stats)  # message.content[0].content (tool_result)
-
-    return json.dumps(obj, ensure_ascii=False)
+    clean_tool_result_content(obj, stats)       # message.content[0].content (tool_result)
+    clean_list_tool_use_result(obj, stats)      # toolUseResult가 list인 경우
+    clean_task_output(obj, stats)               # Task agent output
+    clean_bash_progress(obj, stats)             # bash_progress 데이터
+    clean_input_filepath(obj, stats)            # input의 file_path → 파일명만
+    clean_bash_tags(obj, stats)                 # <bash-stdout>...<bash-stderr>... 패턴
+    clean_user_marked(obj, stats)               # <clean>...</clean> 패턴
+    clean_meta_content(obj, stats)              # isMeta (Skill 결과 등)
 
 
 def clean_transcript(source_path):
@@ -969,35 +1013,15 @@ def clean_transcript(source_path):
     with open(source_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    # 1단계: 일반 클리닝 적용 (hook_progress 제외)
+    # 1단계: 도구별 클리닝 적용
+    # process_line()에 모든 클리닝 로직을 위임하여 단일 책임 유지
     processed_objs = []
     for line in lines:
         line = line.rstrip("\n")
         if line:
             try:
                 obj = json.loads(line)
-                # sessionId 업데이트
-                update_session_id(obj, new_session_id, stats)
-                # 도구별 클리닝
-                clean_thinking(obj, stats)
-                clean_read_result(obj, stats)
-                clean_write_input(obj, stats)
-                clean_write_result(obj, stats)
-                clean_edit_input(obj, stats)
-                clean_edit_result(obj, stats)
-                clean_bash_input(obj, stats)
-                clean_bash_result(obj, stats)
-                clean_filenames_result(obj, stats)
-                clean_exitplanmode_input(obj, stats)
-                clean_tool_result_content(obj, stats)
-                clean_task_output(obj, stats)
-                clean_bash_progress(obj, stats)
-                clean_input_filepath(obj, stats)  # input의 file_path를 파일명만으로
-                clean_bash_tags(
-                    obj, stats
-                )  # <bash-stdout>...</bash-stdout><bash-stderr>...</bash-stderr>
-                clean_user_marked(obj, stats)  # <clean>...</clean>
-                clean_meta_content(obj, stats)  # isMeta (Skill 결과 등)
+                process_line(obj, new_session_id, stats)
                 processed_objs.append(obj)
             except json.JSONDecodeError:
                 processed_objs.append({"_raw_line": line})
@@ -1148,9 +1172,9 @@ def clean_transcript(source_path):
 # ============================================================================
 def main():
     if len(sys.argv) < 2:
-        print("Usage: context-cleaner-v2.py <transcript_path>", file=sys.stderr)
+        print("Usage: context-cleaner.py <transcript_path>", file=sys.stderr)
         print(
-            "Example: ./context-cleaner-v2.py /path/to/session.jsonl", file=sys.stderr
+            "Example: ./context-cleaner.py /path/to/session.jsonl", file=sys.stderr
         )
         sys.exit(1)
 
