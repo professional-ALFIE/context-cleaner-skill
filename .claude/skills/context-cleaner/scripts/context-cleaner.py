@@ -1143,8 +1143,11 @@ def clean_base64_images(obj, stats):
                     if data and data != CLEANED_BASE64_IMAGE:
                         stats.base64_image_bytes += len(str(data).encode("utf-8"))
                         source["data"] = CLEANED_BASE64_IMAGE
-                        source["media_type"] = "image/png"
                         stats.base64_image_count += 1
+                        cleaned = True
+                    # media_type은 data 치환과 독립적으로 항상 확인
+                    if source.get("media_type") != "image/png":
+                        source["media_type"] = "image/png"
                         cleaned = True
         return cleaned
     except Exception:
